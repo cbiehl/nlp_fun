@@ -1,5 +1,8 @@
 import numpy as np
+import shutil
+import os
 import math
+import pickle
 from sklearn.preprocessing import LabelBinarizer
 import nltk
 import keras
@@ -12,7 +15,7 @@ from keras.layers import Input, Embedding, Conv1D, MaxPooling1D, \
 import tensorflow as tf
 
 #constants
-DATA                = "moviereviews.csv"
+DATA                = "bbc-text.csv"
 EMBEDDINGS          = "glove.6B.100d.txt"
 TEST_RATIO          = 0.2
 EMBEDDING_DIM       = 100
@@ -38,12 +41,12 @@ def read_data(path, labelencoder=None, separator=','):
                 continue
 
             # split into tokens
-            # tokens[0] => document
-            # tokens[1] => label
+            # tokens[0] => category / label
+            # tokens[1] => document
             splitline = line.split(separator)
-            x.append(nltk.word_tokenize(splitline[0]))
-            y.append(splitline[1])
-            labels.add(splitline[1])
+            x.append(nltk.word_tokenize(splitline[1]))
+            y.append(splitline[0])
+            labels.add(splitline[0])
 
     if labelencoder is None:
         labelencoder = LabelBinarizer()
@@ -159,7 +162,11 @@ def export_model(model, path):
     signature = tf.saved_model.signature_def_utils.predict_signature_def(
         inputs={'document': model.input}, outputs={'scores': model.output})
 
-    builder = tf.saved_model.builder.SavedModelBuilder('/tmp/saved_model')
+    path = os.path.dirname(os.path.realpath(__file__)) + path
+    if os.path.exists(path) and os.path.isdir(path):
+        shutil.rmtree(path)
+
+    builder = tf.saved_model.builder.SavedModelBuilder(path)
     builder.add_meta_graph_and_variables(
         sess=K.get_session(),
         tags=[tf.saved_model.tag_constants.SERVING],
@@ -170,36 +177,39 @@ def export_model(model, path):
     builder.save()
 
 
-def build_model(embeddings_path, output_dim):
+def build_model(embeddings_path, output_dim, stored_model=None):
+    model = None
     index_dict, vector_dict = read_embeddings(embeddings_path, EMBEDDING_DIM)
-    model = Sequential()
+    if stored_model is None:
+        model = Sequential()
 
-    embedding_weights = np.zeros((len(index_dict), EMBEDDING_DIM))
-    for word, index in index_dict.items():
-        embedding_weights[index, :] = vector_dict[word]
+        embedding_weights = np.zeros((len(index_dict), EMBEDDING_DIM))
+        for word, index in index_dict.items():
+            embedding_weights[index, :] = vector_dict[word]
 
-    # define inputs here
-    embedding = Embedding(
-        output_dim=EMBEDDING_DIM, input_dim=len(index_dict),
-        input_length=MAX_SEQUENCE_LENGTH, trainable=False
-        )
-    embedding.build((None,))
-    embedding.set_weights([embedding_weights])
+        # define inputs here
+        embedding = Embedding(
+            output_dim=EMBEDDING_DIM, input_dim=len(index_dict),
+            input_length=MAX_SEQUENCE_LENGTH, trainable=False
+            )
+        embedding.build((None,))
+        embedding.set_weights([embedding_weights])
 
-    input_layer = Input(shape=(MAX_SEQUENCE_LENGTH,), dtype="int32")
-    embedding_layer = embedding(input_layer)
+        # add layers
+        model.add(embedding)
+        model.add(Dropout(0.4))
+        model.add(Conv1D(filters=10, kernel_size=5, padding="same"))
+        model.add(keras.layers.PReLU())
+        model.add(MaxPooling1D(pool_size=3))
+        model.add(Bidirectional(LSTM(50, recurrent_dropout=0.4, return_sequences=True)))
+        model.add(Bidirectional(LSTM(50, recurrent_dropout=0.4, return_sequences=False)))
+        model.add(Dense(output_dim, activation="softmax"))
 
-    # add layers
-    model.add(embedding)
-    model.add(Dropout(0.4))
-    model.add(Conv1D(filters=10, kernel_size=5, padding="same"))
-    model.add(keras.layers.PReLU())
-    model.add(MaxPooling1D(pool_size=3))
-    model.add(Bidirectional(LSTM(50, recurrent_dropout=0.4, return_sequences=True)))
-    model.add(Bidirectional(LSTM(50, recurrent_dropout=0.4, return_sequences=False)))
-    model.add(Dense(output_dim, activation="softmax"))
+        model.compile(loss="binary_crossentropy", optimizer="nadam", metrics=[f1])
 
-    model.compile(loss="binary_crossentropy", optimizer="nadam", metrics=[f1])
+    else:
+        # load model state
+        model = keras.models.load_model(stored_model)
 
     return model, index_dict
 
@@ -209,8 +219,7 @@ def train(model, batch_size, x_train_emb, x_test_emb, y_train, y_test):
     save_path = "keras_model.hdf5"
 
     earlystop = callbacks.EarlyStopping(monitor="val_f1", min_delta=0.001, patience=2, verbose=0, mode="max")
-    modelcheck = keras.callbacks.ModelCheckpoint(save_path, monitor="val_f1", verbose=2, save_best_only=True,
-                                                 mode="max")
+    modelcheck = keras.callbacks.ModelCheckpoint(save_path, monitor="val_f1", verbose=2, save_best_only=True, mode="max")
 
     model.fit(
         x_train_emb, y_train,
@@ -220,6 +229,15 @@ def train(model, batch_size, x_train_emb, x_test_emb, y_train, y_test):
     )
 
     return model
+
+
+def pad(seq, maxlen, padding_token):
+    return keras.preprocessing.sequence.pad_sequences(seq,
+                                                      maxlen=maxlen,
+                                                      dtype='str',
+                                                      padding='post',
+                                                      truncating='post',
+                                                      value=index_dict[padding_token])
 
 
 def shuffle(a, b):
@@ -232,28 +250,36 @@ def shuffle(a, b):
 
 
 # run it :-)
-model, index_dict = build_model(EMBEDDINGS, 1)
+stored_model = None #'keras_model.hdf5'
+
+print("Constructing model.\n")
+model, index_dict = build_model(EMBEDDINGS, 5, stored_model=stored_model)
+print("Model summary:\n")
 print(model.summary())
 print()
-print("Loading data")
-x, y, labelencoder = read_data(DATA)
-x, y = shuffle(x, y)
-x = keras.preprocessing.sequence.pad_sequences(x,
-                                               maxlen=MAX_SEQUENCE_LENGTH,
-                                               dtype='str',
-                                               padding='post',
-                                               truncating='post',
-                                               value=index_dict[PADDING_TOKEN])
-x_train = x[:math.ceil(x.shape[0] * (1 - TEST_RATIO))]
-x_test = x[math.floor(x.shape[0] * TEST_RATIO):]
-y_train = y[:math.ceil(x.shape[0] * (1 - TEST_RATIO))]
-y_test = y[math.floor(x.shape[0] * TEST_RATIO):]
-x_train_emb = np.asarray([embed(doc, index_dict) for doc in x_train])
-x_test_emb = np.asarray([embed(doc, index_dict) for doc in x_test])
+labelencoder = None
+if stored_model is None:
+    print("Loading data...\n")
+    x, y, labelencoder = read_data(DATA)
+    pickle.dump(labelencoder, open("labelencoder.pickle", "wb"))
+    x, y = shuffle(x, y)
+    x = pad(x, MAX_SEQUENCE_LENGTH, PADDING_TOKEN)
+    x_train = x[:math.ceil(x.shape[0] * (1 - TEST_RATIO))]
+    x_test = x[math.floor(x.shape[0] * TEST_RATIO):]
+    y_train = y[:math.ceil(x.shape[0] * (1 - TEST_RATIO))]
+    y_test = y[math.floor(x.shape[0] * TEST_RATIO):]
+    x_train_emb = np.asarray([embed(doc, index_dict) for doc in x_train])
+    x_test_emb = np.asarray([embed(doc, index_dict) for doc in x_test])
+    print("Done loading data.\n\n")
 
-model = train(model, BATCH_SIZE, x_train_emb, x_test_emb, y_train, y_test)
+    model = train(model, BATCH_SIZE, x_train_emb, x_test_emb, y_train, y_test)
 
-test_example = embed(nltk.word_tokenize("This movie was really horrible!"), index_dict)
-print(model.predict(test_example))
+else:
+    labelencoder = pickle.load(open("labelencoder.pickle", "rb"))
 
-export_model(model, "cnn_bilstm")
+test_example = nltk.word_tokenize("security warning over fbi virus the us federal bureau of investigation is warning that a computer virus is being spread via e-mails that purport to be from the fbi.  the e-mails show that they have come from an fbi.gov address and tell recipients that they have accessed illegal websites. the messages warn that their internet use has been monitored by the fbi s internet fraud complaint center. an attachment in the e-mail contains the virus  the fbi said. the message asks recipients to click on the attachment and answer some questions about their internet use. but rather than being a questionnaire  the attachment contains a virus that infects the recipient s computer  according to the agency. it is not clear what the virus does once it has infected a computer. users are warned never to open attachment from unsolicited e-mails or from people they do not know.   recipients of this or similar solicitations should know that the fbi does not engage in the practice of sending unsolicited e-mails to the public in this manner   the fbi said in a statement. the bureau is investigating the phoney e-mails. the agency earlier this month shut down fbi.gov accounts  used to communicate with the public  because of a security breach. a spokeswoman said the two incidents appear to be unrelated.")
+test_example_emb = pad(np.asarray([embed(test_example, index_dict)]), MAX_SEQUENCE_LENGTH, PADDING_TOKEN)
+
+print(labelencoder.inverse_transform(model.predict(test_example_emb)))
+
+export_model(model, '/tensorflow/saved_model')
